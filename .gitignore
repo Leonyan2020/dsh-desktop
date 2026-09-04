@@ -1,0 +1,11 @@
+build/bin
+node_modules
+frontend/dist
+frontend/node_modules
+third_party/
+dist/
+.DS_Store
+*.exe~
+*.log
+.idea/
+.vscode/

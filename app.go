@@ -27,6 +27,8 @@ type App struct {
 	mu          sync.Mutex
 	quitting    bool
 	pendingView string
+	curTitle    string
+	bootMu      sync.Mutex
 }
 
 func NewApp() *App {
@@ -80,6 +82,22 @@ func (a *App) emitProgress(line string) {
 
 // --- bound API ---
 
+// setTitle 只在标题真正变化时才调用 WindowSetTitle。后者是一条同步的跨线程
+// SendMessage（阻塞到 Wails 主线程处理完），而 GetStatus 会被托盘每 3 秒、
+// 前端每 4 秒轮询，无条件改标题会让主线程持续被同步消息打断。
+func (a *App) setTitle(title string) {
+	if a.ctx == nil {
+		return
+	}
+	a.mu.Lock()
+	changed := a.curTitle != title
+	a.curTitle = title
+	a.mu.Unlock()
+	if changed {
+		wailsruntime.WindowSetTitle(a.ctx, title)
+	}
+}
+
 func (a *App) GetStatus() process.Status {
 	st := a.proc.Status()
 	if st.Version == "" {
@@ -91,10 +109,10 @@ func (a *App) GetStatus() process.Status {
 			st.Message = err.Error()
 		}
 	}
-	if a.ctx != nil && st.Version != "" {
-		wailsruntime.WindowSetTitle(a.ctx, "Harness "+st.Version)
-	} else if a.ctx != nil {
-		wailsruntime.WindowSetTitle(a.ctx, "DSH Desktop")
+	if st.Version != "" {
+		a.setTitle("Harness " + st.Version)
+	} else {
+		a.setTitle("DSH Desktop")
 	}
 	return st
 }
@@ -116,6 +134,13 @@ func (a *App) ConsumePendingView() string {
 
 // BootstrapEnvironment prepares Node/pnpm/dsh for zero-setup machines.
 func (a *App) BootstrapEnvironment() error {
+	// 托盘回调现在并行派发，托盘和前端可能同时触发引导；用 bootMu 串行化，
+	// 等待方复查后直接返回，避免重复下载安装。
+	a.bootMu.Lock()
+	defer a.bootMu.Unlock()
+	if ready := a.rt.ReadyStatus(); !ready.NeedsSetup && ready.NodeOK {
+		return nil
+	}
 	err := a.rt.Bootstrap(func(line string) {
 		a.emitProgress(line)
 	})

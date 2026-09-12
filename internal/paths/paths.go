@@ -1,8 +1,10 @@
 package paths
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Layout:
@@ -35,6 +37,18 @@ func RuntimeDir(v string) string {
 }
 func DesktopDir() string { return filepath.Join(Home(), "desktop") }
 func ConsoleLog() string { return filepath.Join(DesktopDir(), "dsh-web-console.log") }
+func ShellLog() string   { return filepath.Join(DesktopDir(), "shell.log") }
+
+// AppendShellLog 记录壳自己的诊断日志（导航、进程、token 捕获），
+// 失败静默：诊断不能影响主流程。
+func AppendShellLog(format string, args ...interface{}) {
+	f, err := os.OpenFile(ShellLog(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, time.Now().Format("2006-01-02 15:04:05 ")+format+"\n", args...)
+}
 
 // AppDataRoot is %LOCALAPPDATA%\dsh-desktop — portable toolchain cache.
 func AppDataRoot() string {

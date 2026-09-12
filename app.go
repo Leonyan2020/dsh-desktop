@@ -28,6 +28,7 @@ type App struct {
 	quitting    bool
 	pendingView string
 	curTitle    string
+	inHarness   bool // 主窗口当前显示的是 harness 页面（React 前端已被导航走）
 	bootMu      sync.Mutex
 }
 
@@ -70,6 +71,7 @@ func (a *App) navigateInWindow(url string) {
 	if a.ctx == nil || url == "" {
 		return
 	}
+	paths.AppendShellLog("navigate -> %s", url)
 	js := fmt.Sprintf("window.location.replace(%q)", url)
 	wailsruntime.WindowExecJS(a.ctx, js)
 }
@@ -177,9 +179,11 @@ func (a *App) StartHarness() error {
 			return err
 		}
 	}
+	pidBefore := a.proc.PID()
 	if err := a.proc.Start(a.rt); err != nil {
 		return err
 	}
+	pidAfter := a.proc.PID()
 	go func() {
 		ok := a.waitReadyWithRetry()
 		if a.ctx != nil {
@@ -196,6 +200,10 @@ func (a *App) StartHarness() error {
 			} else {
 				wailsruntime.EventsEmit(a.ctx, "toast", "启动超时：插件热身可能仍在进行，可稍后点「进入 Harness」")
 			}
+		}
+		// 确实拉起了新进程、且窗口停在 harness 页面时，跳到新 token URL 恢复页面
+		if ok && pidAfter != 0 && pidAfter != pidBefore {
+			a.renavigateHarness()
 		}
 	}()
 	return nil
@@ -236,8 +244,29 @@ func (a *App) RestartHarness() error {
 				wailsruntime.EventsEmit(a.ctx, "harness-ready", st)
 			}
 		}
+		if ok {
+			// 重启换了 token：窗口若停在 harness 页面，旧页面已失效，跳新 URL 恢复
+			a.renavigateHarness()
+		}
 	}()
 	return nil
+}
+
+// renavigateHarness 在窗口正显示 harness 页面时，等新 token URL 就绪并重新导航；
+// 窗口在壳自己的界面（boot/版本管理）时不动，由用户手动进入。
+func (a *App) renavigateHarness() {
+	a.mu.Lock()
+	in := a.inHarness
+	a.mu.Unlock()
+	if !in || a.ctx == nil {
+		return
+	}
+	a.proc.WaitWebURL(3 * time.Minute)
+	if st := a.GetStatus(); st.Listening {
+		a.navigateInWindow(st.URL)
+		time.Sleep(1500 * time.Millisecond)
+		a.navigateInWindow(st.URL) // 第二跳带上 Strict cookie（见 EnterHarness 注释）
+	}
 }
 
 func (a *App) EnterHarness() error {
@@ -260,16 +289,35 @@ func (a *App) EnterHarness() error {
 		}
 		st = a.GetStatus()
 	}
+	// 新版 dsh web 需要先打开打印出来的带 token URL 才会种下会话 cookie；
+	// 端口就绪后 URL 行要等插件装载完才打印（实测可晚 1 分钟以上），所以
+	// 只等自家进程、最长 3 分钟（与端口等待一致），拿到再导航，避免裸地址撞 401。
+	// 外部 dsh web 的 URL 到不了壳手里，不等待，直接导航（harness 会显示 401 提示）。
+	if a.proc.OwnsProcess() {
+		a.proc.WaitWebURL(3 * time.Minute)
+	}
+	st = a.GetStatus()
+	paths.AppendShellLog("enter-harness: listening=%v owns=%v url=%s", st.Listening, a.proc.OwnsProcess(), st.URL)
 	if a.ctx != nil {
 		wailsruntime.WindowShow(a.ctx)
 	}
 	a.navigateInWindow(st.URL)
+	// dsh 的会话 cookie 是 SameSite=Strict：从 wails:// 页面发起的跨站导航
+	// 不携带 Strict cookie，303 回 "/" 时没有 cookie 会被 401。第一跳之后
+	// 页面 origin 已是 127.0.0.1，再补一跳同样的 token URL，重定向就能带上
+	// cookie 落进应用。（若第一跳已认证成功，第二跳只是幂等地重进一次。）
+	time.Sleep(1500 * time.Millisecond)
+	a.navigateInWindow(st.URL)
+	a.mu.Lock()
+	a.inHarness = true
+	a.mu.Unlock()
 	return nil
 }
 
 func (a *App) ShowVersionManager() {
 	a.mu.Lock()
 	a.pendingView = "manage"
+	a.inHarness = false // 窗口即将回到壳自己的界面
 	a.mu.Unlock()
 	if a.ctx != nil {
 		wailsruntime.WindowShow(a.ctx)
@@ -338,7 +386,7 @@ func (a *App) SwitchVersion(version string) error {
 func (a *App) GetAppInfo() map[string]string {
 	return map[string]string{
 		"name":    "DSH Desktop",
-		"version": "0.2.3",
+		"version": "0.2.4",
 		"dshHome": paths.Home(),
 		"note":    "安装包内附 Node20 + pnpm + 预置 Harness；首次可离线展开",
 	}
